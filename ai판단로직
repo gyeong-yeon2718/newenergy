@@ -1,0 +1,92 @@
+import time
+
+class HybridEnergySystem:
+    """
+    AI의 핵심 판단 로직을 담고 있는 하이브리드 에너지 시스템 클래스입니다.
+    A부하(주택), B부하(공장), ESS, 수소연료전지를 관리합니다.
+    """
+    
+    def __init__(self, initial_ess_soc=50.0, initial_h2_storage=100.0):
+        # === 1. 자산 현재 상태 (State) ===
+        # ESS는 변동값, 수소는 비상 자원이므로 100%로 가정
+        self.ess_soc = initial_ess_soc           # (변수) ESS 현재 충전량 (%)
+        self.h2_storage = initial_h2_storage     # (상수) 수소 저장량 (%, 100%로 가정)
+
+        # === 2. 계통 판단 기준 (Thresholds) ===
+        # (연구노트 4. 계통 판단 기준)
+        self.B_LOAD_PEAK_RATIO = 1.5   # B부하 피크 기준: 평균의 150%
+        
+        # (연구노트 4. Phase 1 판단 조건)
+        self.SMP_PROFIT_THRESHOLD = 150  # (가정) Phase 1 수익 창출을 위한 SMP 기준치 (예: 150원)
+        self.ESS_PROFIT_THRESHOLD = 30   # (가정) Phase 1 수익 창출을 위한 ESS 최소 잔량 (예: 30%)
+        
+        # === 3. 자산 성능 (Specification) ===
+        # (연구노트 3. Phase 2) AI가 ESS로 감당 가능한지 판단하기 위한 스펙
+        self.ESS_MAX_DISCHARGE_KW = 100  # (가정) ESS가 최대로 방전할 수 있는 전력 (예: 100kW)
+        self.H2_FUEL_CELL_KW = 500       # (가정) 수소 연료전지 발전 용량 (예: 500kW)
+
+    
+    def charge_assets(self, current_time, surplus_power_kw):
+        """
+        [1. 학습 데이터]의 잉여전력 학습 로직을 시뮬레이션합니다.
+        잉여 전력이 발생하면 자산을 충전합니다.
+        """
+        action = "IDLE"
+        
+        # 1. 단기 잉여 (낮 12-13시) -> ESS 저장
+        if current_time in [12, 13] and surplus_power_kw > 0:
+            # (단순화) 잉여전력만큼 ESS 충전. 100% 초과 방지
+            self.ess_soc = min(100.0, self.ess_soc + surplus_power_kw) 
+            action = f"ACTION: CHARGE_ESS (SoC: {self.ess_soc:.1f}%)"
+            
+        # 2. 장기 잉여 (심야) -> 수소 변환
+        if current_time in [0, 1, 2, 3] and surplus_power_kw > 0:
+            # (단순화) 수소 충전. 100% 초과 방지
+            self.h2_storage = min(100.0, self.h2_storage + surplus_power_kw)
+            action = f"ACTION: CHARGE_HYDROGEN (Storage: {self.h2_storage:.1f}%)"
+            
+        return action
+
+    def make_ai_decision(self, current_time, b_load_power, b_load_average, smp_price):
+        """
+        [4. 계통 판단 기준]에 따라 AI가 Phase 1 또는 Phase 2를 결정합니다.
+        이 함수가 AI의 핵심 두뇌입니다.
+        """
+        
+        # --- 1. Phase 2 판단 (안정성) ---
+        # (연구노트 4. B부하 피크발생: B부하평균 150% 이상)
+        is_b_peak_detected = (b_load_power >= b_load_average * self.B_LOAD_PEAK_RATIO)
+        
+        if is_b_peak_detected:
+            # (연구노트 3. Phase 2 - 2) AI가 ESS 잔량으로 감당 불가능한 규모로 판단
+            if b_load_power > self.ESS_MAX_DISCHARGE_KW:
+                
+                # (연구노트 4. Phase 2 - 2) 수소는 늘 100% 충전이라고 가정
+                if self.h2_storage > 0: 
+                    # TODO: 여기서 실제로는 self.h2_storage -= (b_load_power / self.H2_FUEL_CELL_KW) 만큼 차감
+                    return "[PHASE 2] B부하 피크 감지! 수소 연료전지 가동!"
+                else:
+                    return "[ERROR] B부하 피크 감지! 사용가능한 수소 없음!"
+            else:
+                # (선택적 로직) B부하 피크가 있긴 한데, ESS로도 감당 가능한 경우
+                if self.ess_soc > (b_load_power / self.ESS_MAX_DISCHARGE_KW * 100):
+                    # TODO: self.ess_soc -= ...
+                    return "[PHASE 1] B부하 피크 감지. ESS로 대응합니다."
+                else:
+                    return "[ERROR] B부하 피크 감지! ESS 잔량 부족!"
+
+        # --- 2. Phase 1 판단 (경제성) ---
+        # (B부하 피크가 발생하지 않았을 때만 실행)
+        
+        # (연구노트 4. Phase 1 조건 2) ESS 잉여 전력 > 기준치
+        is_ess_ready = (self.ess_soc > self.ESS_PROFIT_THRESHOLD)
+        
+        # (연구노트 4. Phase 1 조건 3) SMP > 기준치
+        is_smp_high = (smp_price > self.SMP_PROFIT_THRESHOLD)
+        
+        if is_ess_ready and is_smp_high:
+            # TODO: 여기서 실제로는 self.ess_soc -= (방전량) 만큼 차감
+            return f"[PHASE 1] SMP({smp_price}원) 높음. A부하로 이동, ESS 방전 (수익 창출)"
+
+        # --- 3. 대기 ---
+        return "IDLE (B부하 안정, SMP 낮음 또는 ESS 잔량 부족)
