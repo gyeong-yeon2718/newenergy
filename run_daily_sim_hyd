@@ -1,0 +1,245 @@
+# run_daily_sim.py
+# -------------------------------------------
+# 하루 단위 규칙기반 AI 시뮬레이션 실행 스크립트 (+ 경제성 계산, 충전확대, 연속방전)
+# -------------------------------------------
+
+import pandas as pd
+
+# ===== 0) 파일 경로 설정 =====
+RELATIVE_PATH = "ai_dataset_single_day.xlsx"
+EXCEL_PATH = RELATIVE_PATH
+
+# ===== 1) 데이터 로드 & 전처리 =====
+df = pd.read_excel(EXCEL_PATH)
+print("데이터 로드 완료")
+print(df.head())
+
+
+required_cols = {"hour", "A_load_kWh", "B_load_kWh", "SMP_price", "surplus_kWh"}
+missing = required_cols - set(df.columns)
+
+# 피크 판정 기준용 평균/최대
+b_load_avg = float(df["B_load_kWh"].mean())
+b_load_max = float(df["B_load_kWh"].max())
+
+# ===== 2) 규칙기반 AI 클래스 (경제성 + 충전확대 + 연속방전) =====
+class HybridEnergySystem:
+    """
+    A부하(주택), B부하(공장), ESS, 수소연료전지 관리 + Phase1 경제성 계산
+    - 낮 10~15시 충전(잉여전력×보정)
+    - Phase1 트리거 시 연속 방전 세션(3시간)
+    """
+
+    def __init__(self,
+                 initial_ess_soc=30.0,
+                 initial_h2_storage=20.0,
+                 ess_capacity_kwh=5000.0,       # 5MWh
+                 charge_cost_won_per_kwh=110.0,
+                 round_trip_eff=0.92,           # 왕복효율
+                 min_margin_won_per_kwh=20.0,   # 최소 마진
+                 session_length_hours=3):        # 연속 방전 시간(시간)
+        # 상태
+        self.ess_soc = float(initial_ess_soc)
+        self.h2_storage = float(initial_h2_storage)
+        self.H2_PCT_PER_HOUR_AT_RATED = 20.0  # 정격 1시간 가동 시 탱크 소모 비율(%)
+        self.discharge_session = 0               # 현재 남은 연속 방전 시간
+        self.SESSION_LENGTH = int(session_length_hours)
+
+        # 파라미터
+        self.ESS_CAPACITY_KWH = float(ess_capacity_kwh)
+        self.CHARGE_COST_WON_PER_KWH = float(charge_cost_won_per_kwh)
+        self.ROUND_TRIP_EFF = float(round_trip_eff)
+        self.MIN_MARGIN = float(min_margin_won_per_kwh)
+
+        # 임계치
+        self.B_LOAD_PEAK_RATIO = 1.5
+        self.SMP_PROFIT_THRESHOLD = 150
+        self.ESS_PROFIT_THRESHOLD = 30
+
+        # 설비 스펙
+        self.ESS_MAX_DISCHARGE_KW = 500          # 시간당 최대 방전량
+        self.H2_FUEL_CELL_KW = 500
+
+        # 경제성 누적
+        self.cumulative_profit = 0.0
+
+    # --- SoC% ↔ kWh 변환 유틸 ---
+    def _soc_to_kwh(self) -> float:
+        return (self.ess_soc / 100.0) * self.ESS_CAPACITY_KWH
+
+    def _kwh_to_soc_delta(self, kwh: float) -> float:
+        return (kwh / self.ESS_CAPACITY_KWH) * 100.0
+
+    def charge_assets(self, current_time, surplus_power_kwh):
+        """
+        낮 10~15시: surplus로 충전(원가 0) — surplus 보정 계수 적용
+        심야 0~3시: 수소 저장(데모용)
+        """
+        action = "IDLE"
+        revenue = 0.0
+        cost = 0.0
+        profit = 0.0
+
+        # 충전 구간 확대 + 보정계수(×3.0)
+        if current_time in range(10, 16) and surplus_power_kwh > 0:
+            ess_space_kwh = max(0.0, self.ESS_CAPACITY_KWH - self._soc_to_kwh())
+            charge_kwh = min(ess_space_kwh, float(surplus_power_kwh) * 3.0)
+            if charge_kwh > 0:
+                self.ess_soc = min(100.0, self.ess_soc + self._kwh_to_soc_delta(charge_kwh))
+                cost = 0.0  # 잉여 전력 충전은 0원
+                action = f"ACTION: CHARGE_ESS +{charge_kwh:.1f}kWh (SoC: {self.ess_soc:.1f}%)"
+
+        # 심야 수소 저장(경제성은 제외)
+        if current_time in [0, 1, 2, 3] and surplus_power_kwh > 0:
+            self.h2_storage = min(80.0, self.h2_storage + surplus_power_kwh)
+            action = f"ACTION: CHARGE_HYDROGEN (Storage: {self.h2_storage:.1f}%)"
+
+        return action, revenue, cost, profit
+
+    def _discharge_once(self, smp_price):
+        """연속 방전 1시간 수행(내부 헬퍼): 수익/이익 계산 및 SoC 감소"""
+        revenue = cost = profit = 0.0
+        ess_energy_kwh = self._soc_to_kwh()
+        discharge_kwh = min(self.ESS_MAX_DISCHARGE_KW, ess_energy_kwh)
+        if discharge_kwh <= 0:
+            return "IDLE (ESS 잔량 부족)", 0.0, 0.0, 0.0
+
+        sellable_kwh = discharge_kwh * self.ROUND_TRIP_EFF
+        revenue = sellable_kwh * float(smp_price)
+        cost = 0.0  # surplus 원가 0 가정
+        profit = revenue - cost
+
+        self.ess_soc = max(0.0, self.ess_soc - self._kwh_to_soc_delta(discharge_kwh))
+        self.cumulative_profit += profit
+        return (f"[PHASE 1] ESS 방전 {discharge_kwh:.1f}kWh "
+                f"(유효 {sellable_kwh:.1f}kWh, SoC {self.ess_soc:.1f}%)"), revenue, cost, profit
+
+    def make_ai_decision(self, current_time, b_load_power, b_load_average, smp_price):
+        revenue = cost = profit = 0.0
+
+        # 연속 방전 세션이 진행 중이면 계속 방전 (SMP가 아주 낮지 않은 한)
+        if self.discharge_session > 0:
+            self.discharge_session -= 1
+            msg, revenue, cost, profit = self._discharge_once(smp_price)
+            return f"[PHASE 1-연속방전] {msg} (잔여 {self.discharge_session}h)", revenue, cost, profit
+
+        # Phase 2 (동일)
+        is_b_peak_detected = (b_load_power >= b_load_average * self.B_LOAD_PEAK_RATIO)
+        if is_b_peak_detected:
+            if b_load_power > self.ESS_MAX_DISCHARGE_KW:
+                if self.h2_storage > 0:
+                    # === 수소 잔량 방전 반영 (퍼센트 모델) ===
+                    # ESS가 커버 못하는 필요전력(kW)
+                    required_kw = b_load_power - self.ESS_MAX_DISCHARGE_KW
+                    # 연료전지 한도 내에서 공급
+                    fc_kw = min(required_kw, self.H2_FUEL_CELL_KW)
+
+                    if fc_kw > 0:
+                        # 100% 수소 = 연료전지 정격(H2_FUEL_CELL_KW)로 1시간 가동한다고 가정
+                        needed_pct_hour = (fc_kw / self.H2_FUEL_CELL_KW) * self.H2_PCT_PER_HOUR_AT_RATED
+                        use_pct = min(self.h2_storage, needed_pct_hour)
+
+                        # 실제 공급 전력은 사용 퍼센트에 비례
+                        supplied_kw = (use_pct / 100.0) * self.H2_FUEL_CELL_KW
+
+                        # 수소 잔량 차감
+                        self.h2_storage = max(0.0, self.h2_storage - use_pct)
+
+                        return (f"[PHASE 2] B부하 피크 감지! 연료전지 {supplied_kw:.1f}kW 가동 "
+                                f"(H2 -{use_pct:.1f}% → {self.h2_storage:.1f}%)",
+                                revenue, cost, profit)
+                    else:
+                        return "[ERROR] B부하 피크 감지! 연료전지 출력 0kW", revenue, cost, profit
+                else:
+                    return "[ERROR] B부하 피크 감지! 사용가능한 수소 없음!", revenue, cost, profit
+            else:
+                if self.ess_soc > (b_load_power / self.ESS_MAX_DISCHARGE_KW * 100):
+                    return "[PHASE 1] B부하 피크 감지. ESS로 대응합니다.", revenue, cost, profit
+                else:
+                    return "[ERROR] B부하 피크 감지! ESS 잔량 부족!", revenue, cost, profit
+
+        # Phase 1 (경제성 트리거)
+        is_ess_ready = (self.ess_soc > self.ESS_PROFIT_THRESHOLD)
+        is_smp_high = (smp_price > self.SMP_PROFIT_THRESHOLD)
+
+        if is_ess_ready and is_smp_high:
+            # 방전 세션 시작: 현재 포함 1h + 이후 (SESSION_LENGTH-1)h
+            self.discharge_session = max(self.SESSION_LENGTH - 1, 0)
+            msg, revenue, cost, profit = self._discharge_once(smp_price)
+            return f"[PHASE 1-세션시작] {msg} (추가 {self.discharge_session}h 예정)", revenue, cost, profit
+
+        return "IDLE (B부하 안정, SMP 낮음 또는 ESS 잔량 부족)", revenue, cost, profit
+
+
+# ===== 3) 시뮬레이션 설정 =====
+system = HybridEnergySystem(
+    initial_ess_soc=30.0,            # 초기 SoC 상향
+    initial_h2_storage=90.0,
+    ess_capacity_kwh=5000.0,         # 5MWh
+    #charge_cost_won_per_kwh=110.0,   # (충전 가격/ 일단은 0원처리)
+    #min_margin_won_per_kwh=20.0,
+    round_trip_eff=0.92,
+    session_length_hours=3           # 연속 방전 3시간
+)
+
+# ▶ 옵션: Phase 2가 최소 1회 나오게 동적 임계치 설정 (시연용)
+FORCE_PHASE2_ONCE = True
+if FORCE_PHASE2_ONCE:
+    dynamic_ratio = (b_load_max / b_load_avg) * 0.98
+    system.B_LOAD_PEAK_RATIO = dynamic_ratio
+    print(f"⚙️  B_LOAD_PEAK_RATIO 동적 설정: {dynamic_ratio:.3f} (기본 1.500 → 동적값)")
+
+# ===== 4) 24시간 루프 실행 =====
+logs = []
+cum_profit = 0.0
+
+for _, r in df.iterrows():
+    hour = int(r["hour"])
+    surplus = float(r["surplus_kWh"])
+    smp = float(r["SMP_price"])
+    b_load = float(r["B_load_kWh"])
+
+    # (1) 잉여전력 충전 (원가 0)
+    charge_action, ch_rev, ch_cost, ch_profit = system.charge_assets(hour, surplus)
+
+    # (2) 운영 판단 (Phase1이면 연속방전 포함)
+    decision, revenue, cost, profit = system.make_ai_decision(hour, b_load, b_load_avg, smp)
+
+    # 시간대 순이익(충전비용 차감; 현재 ch_cost=0)
+    net_profit = (ch_profit + profit) - ch_cost
+    cum_profit += net_profit
+
+    logs.append({
+        "hour": hour,
+        "B_load_kWh": b_load,
+        "SMP_price": smp,
+        "surplus_kWh": surplus,
+        "decision": decision,
+        "charge_action": charge_action,
+        "ess_soc(%)": round(system.ess_soc, 2),
+        "h2_storage(%)": round(system.h2_storage, 2),
+        "revenue_won": round(revenue, 0),
+        "cost_won": round(ch_cost + cost, 0),
+        "profit_won": round(net_profit, 0),
+        "cum_profit_won": round(cum_profit, 0)
+    })
+
+result = pd.DataFrame(logs)
+
+# ===== 5) 결과 저장 & 요약 =====
+OUT_XLSX = "AI_Daily_Operation_Log_new.xlsx"
+OUT_CSV = "AI_Daily_Operation_Log_new.csv"
+result.to_excel(OUT_XLSX, index=False)
+result.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+
+print(f"\n💾 결과 저장 완료: {OUT_XLSX}, {OUT_CSV}")
+print(result.head(10)[["hour","decision","charge_action","revenue_won","cost_won","profit_won","cum_profit_won"]])
+
+summary = result["decision"].value_counts()
+print("\n=== 의사결정 요약 ===")
+for k, v in summary.items():
+    print(f"{k}: {v}시간")
+
+phase2_hours = result.loc[result["decision"].str.contains("PHASE 2", na=False), "hour"].tolist()
+print("\nPHASE 2 발생 시각:", phase2_hours if phase2_hours else "없음")
+print("총 누적 이익(원):", int(result["cum_profit_won"].iloc[-1]))
