@@ -14,13 +14,6 @@ df = pd.read_excel(EXCEL_PATH)
 print("데이터 로드 완료")
 print(df.head())
 
-# (컬럼명이 다를 경우를 대비해 최소한의 통일)
-df = df.rename(columns={
-    "apt_load_kWh": "A_load_kWh",
-    "plant_load_kWh": "B_load_kWh",
-    "smp_krw_per_kWh": "SMP_price",
-    "surplus_kwh": "surplus_kWh",
-})
 
 required_cols = {"hour", "A_load_kWh", "B_load_kWh", "SMP_price", "surplus_kWh"}
 missing = required_cols - set(df.columns)
