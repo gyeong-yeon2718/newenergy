@@ -1,0 +1,105 @@
+# ARDUINO MEGA 2560 블루투스 제어
+// ===============================
+// DFRobot Motor Shield R3 (DFR0406)
+// Arduino Mega 2560
+// HC-05 블루투스 제어 추가
+// ===============================
+
+// 모터 쉴드 핀 설정 (기존 코드와 동일)
+const int BRAKEA = 9;
+const int BRAKEB = 8;
+const int DIRA   = 12;
+const int DIRB   = 13;
+const int PWMA   = 10; // 왼쪽 모터 속도 (Motor A)
+const int PWMB   = 11; // 오른쪽 모터 속도 (Motor B)
+
+// 제어 속도값 (기존 코드의 속도 차이 유지)
+const int SPEED_A = 180;
+const int SPEED_B = 250;
+
+void setup() {
+  // USB 시리얼 (PC 디버깅용)
+  Serial.begin(9600);
+  
+  // HC-05 블루투스 모듈용 하드웨어 시리얼 (Serial1)
+  // Mega 19(TX1), 18(RX1) 핀 사용
+  Serial1.begin(9600); 
+
+  // 모터 핀 초기화
+  pinMode(BRAKEA, OUTPUT);
+  pinMode(BRAKEB, OUTPUT);
+  pinMode(DIRA, OUTPUT);
+  pinMode(DIRB, OUTPUT);
+  pinMode(PWMA, OUTPUT);
+  pinMode(PWMB, OUTPUT);
+
+  stopMotors(); // 모터 정지 상태로 시작
+  delay(500);
+  Serial.println("모터 초기화 완료. 블루투스 명령어 대기 중...");
+}
+
+void loop() {
+  // Serial1 (블루투스)로부터 데이터가 수신되었는지 확인
+  if (Serial1.available() > 0) {
+    
+    // '\n' (줄바꿈) 문자가 올 때까지 문자열을 읽어옵니다.
+    String command = Serial1.readStringUntil('\n');
+    command.trim(); // 수신된 문자열의 앞뒤 공백 제거
+
+    // 디버깅: PC 시리얼 모니터로 수신된 명령어 출력
+    Serial.print("Command Received: [");
+    Serial.print(command);
+    Serial.println("]");
+
+    // 수신된 문자열에 따라 모터 제어
+    if (command == "forward") {
+      // 기존 속도(180, 250)로 전진
+      moveForward(SPEED_A, SPEED_B);
+    } 
+    else if (command == "backward") {
+      // 기존 속도(180, 250)로 후진
+      moveBackward(SPEED_A, SPEED_B);
+    } 
+    else if (command == "stop") {
+      stopMotors();
+    }
+  }
+}
+
+// ===============================
+// 제어 함수 (기존 코드와 동일)
+// ===============================
+void moveForward(int spdA, int spdB) {
+  digitalWrite(BRAKEA, LOW);
+  digitalWrite(BRAKEB, LOW);
+  digitalWrite(DIRA, HIGH);
+  digitalWrite(DIRB, HIGH);
+  analogWrite(PWMA, spdA);
+  analogWrite(PWMB, spdB);
+  Serial.print("전진 A:");
+  Serial.print(spdA);
+  Serial.print("  B:");
+  Serial.println(spdB);
+}
+
+void moveBackward(int spdA, int spdB) {
+  digitalWrite(BRAKEA, LOW);
+  digitalWrite(BRAKEB, LOW);
+  digitalWrite(DIRA, LOW);
+  digitalWrite(DIRB, LOW);
+  analogWrite(PWMA, spdA);
+  analogWrite(PWMB, spdB);
+  Serial.print("후진 A:");
+  Serial.print(spdA);
+  Serial.print("  B:");
+  Serial.println(spdB);
+}
+
+void stopMotors() {
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
+  digitalWrite(BRAKEA, HIGH);
+  digitalWrite(BRAKEB, HIGH);
+  Serial.println("정지");
+}
+
