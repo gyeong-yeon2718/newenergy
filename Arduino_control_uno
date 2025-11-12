@@ -1,4 +1,6 @@
 # Arduino UNO 블루투스 모듈 제어
+# Arduio_control_mega 코드와 동일하나 보드가 Arduino UNO 일 때 작동하는 코드입니다.
+UNO는 MEGA와 달리 serial port 가 하나이기 때문에 앞부분이 조금 다릅니다. 
 
 #include <SoftwareSerial.h>
 
