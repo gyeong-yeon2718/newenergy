@@ -1,0 +1,333 @@
+# ==========================================================
+# run_daily_sim.py (AI 시뮬레이션)
+# +
+# arduino_control.py (블루투스 차량 제어)
+#
+# AI 시뮬레이션 결과(Phase)에 따라 아두이노 차량을 실시간 제어
+# ==========================================================
+
+import pandas as pd
+import serial  # (추가) 아두이노 제어용
+import time  # (추가) 실시간 제어용
+
+# ===== (추가) 아두이노 블루투스 설정 =====
+# (필수 수정!) PC 장치 관리자에서 확인한 COM 포트
+BLUETOOTH_PORT = "COM7"
+BAUD_RATE = 9600
+
+# (필수 수정!) 시뮬레이션 1시간(1 loop)당 대기할 시간 (초)
+# 차량이 해당 동작(전진/후진)을 수행할 시간
+TIME_PER_HOUR_SEC = 5.0
+
+
+# 아두이노 명령어 전송 함수
+def send_command(ser, command):
+    """
+    아두이노로 명령어를 전송합니다. ('command\n' 형태)
+    """
+    try:
+        command_with_newline = command + '\n'
+        ser.write(command_with_newline.encode('utf-8'))
+        print(f"[Arduino] Sent: {command}")
+        time.sleep(0.1)  # 전송 안정성을 위한 짧은 대기
+    except Exception as e:
+        print(f"[Arduino] Error sending command: {e}")
+
+
+# ===== 0) 파일 경로 설정 =====
+RELATIVE_PATH = "ai_dataset_single_day.xlsx"
+EXCEL_PATH = RELATIVE_PATH
+
+# ===== 1) 데이터 로드 & 전처리 =====
+try:
+    df = pd.read_excel(EXCEL_PATH)
+    print("데이터 로드 완료")
+    print(df.head())
+except FileNotFoundError:
+    print(f"오류: {EXCEL_PATH} 파일을 찾을 수 없습니다.")
+    print("스크립트와 같은 폴더에 엑셀 파일이 있는지 확인하세요.")
+    exit()  # 파일 없으면 종료
+
+# (이하 기존 코드와 동일)
+required_cols = {"hour", "A_load_kWh", "B_load_kWh", "SMP_price", "surplus_kWh"}
+missing = required_cols - set(df.columns)
+b_load_avg = float(df["B_load_kWh"].mean())
+b_load_max = float(df["B_load_kWh"].max())
+
+
+# ===== 2) 규칙기반 AI 클래스 (경제성 + 충전확대 + 연속방전) =====
+# (제공해주신 클래스 코드 - 변경 없음)
+class HybridEnergySystem:
+    # ... (제공해주신 클래스 코드 전체) ...
+    """
+    A부하(주택), B부하(공장), ESS, 수소연료전지 관리 + Phase1 경제성 계산
+    - 낮 10~15시 충전(잉여전력×보정)
+    - Phase1 트리거 시 연속 방전 세션(3시간)
+    """
+
+    def __init__(self,
+                 initial_ess_soc=30.0,
+                 initial_h2_storage=20.0,
+                 ess_capacity_kwh=5000.0,  # 5MWh
+                 charge_cost_won_per_kwh=110.0,
+                 round_trip_eff=0.92,  # 왕복효율
+                 min_margin_won_per_kwh=20.0,  # 최소 마진
+                 session_length_hours=3):  # 연속 방전 시간(시간)
+        # 상태
+        self.ess_soc = float(initial_ess_soc)
+        self.h2_storage = float(initial_h2_storage)
+        self.H2_PCT_PER_HOUR_AT_RATED = 20.0  # 정격 1시간 가동 시 탱크 소모 비율(%)
+        self.discharge_session = 0  # 현재 남은 연속 방전 시간
+        self.SESSION_LENGTH = int(session_length_hours)
+
+        # 파라미터
+        self.ESS_CAPACITY_KWH = float(ess_capacity_kwh)
+        self.CHARGE_COST_WON_PER_KWH = float(charge_cost_won_per_kwh)
+        self.ROUND_TRIP_EFF = float(round_trip_eff)
+        self.MIN_MARGIN = float(min_margin_won_per_kwh)
+
+        # 임계치
+        self.B_LOAD_PEAK_RATIO = 1.5
+        self.SMP_PROFIT_THRESHOLD = 150
+        self.ESS_PROFIT_THRESHOLD = 30
+
+        # 설비 스펙
+        self.ESS_MAX_DISCHARGE_KW = 500  # 시간당 최대 방전량
+        self.H2_FUEL_CELL_KW = 500
+
+        # 경제성 누적
+        self.cumulative_profit = 0.0
+
+    # --- SoC% ↔ kWh 변환 유틸 ---
+    def _soc_to_kwh(self) -> float:
+        return (self.ess_soc / 100.0) * self.ESS_CAPACITY_KWH
+
+    def _kwh_to_soc_delta(self, kwh: float) -> float:
+        return (kwh / self.ESS_CAPACITY_KWH) * 100.0
+
+    def charge_assets(self, current_time, surplus_power_kwh):
+        """
+        낮 10~15시: surplus로 충전(원가 0) — surplus 보정 계수 적용
+        심야 0~3시: 수소 저장(데모용)
+        """
+        action = "IDLE"
+        revenue = 0.0
+        cost = 0.0
+        profit = 0.0
+
+        # 충전 구간 확대 + 보정계수(×3.0)
+        if current_time in range(10, 16) and surplus_power_kwh > 0:
+            ess_space_kwh = max(0.0, self.ESS_CAPACITY_KWH - self._soc_to_kwh())
+            charge_kwh = min(ess_space_kwh, float(surplus_power_kwh) * 3.0)
+            if charge_kwh > 0:
+                self.ess_soc = min(100.0, self.ess_soc + self._kwh_to_soc_delta(charge_kwh))
+                cost = 0.0  # 잉여 전력 충전은 0원
+                action = f"ACTION: CHARGE_ESS +{charge_kwh:.1f}kWh (SoC: {self.ess_soc:.1f}%)"
+
+        # 심야 수소 저장(경제성은 제외)
+        if current_time in [0, 1, 2, 3] and surplus_power_kwh > 0:
+            self.h2_storage = min(80.0, self.h2_storage + surplus_power_kwh)
+            action = f"ACTION: CHARGE_HYDROGEN (Storage: {self.h2_storage:.1f}%)"
+
+        return action, revenue, cost, profit
+
+    def _discharge_once(self, smp_price):
+        """연속 방전 1시간 수행(내부 헬퍼): 수익/이익 계산 및 SoC 감소"""
+        revenue = cost = profit = 0.0
+        ess_energy_kwh = self._soc_to_kwh()
+        discharge_kwh = min(self.ESS_MAX_DISCHARGE_KW, ess_energy_kwh)
+        if discharge_kwh <= 0:
+            return "IDLE (ESS 잔량 부족)", 0.0, 0.0, 0.0
+
+        sellable_kwh = discharge_kwh * self.ROUND_TRIP_EFF
+        revenue = sellable_kwh * float(smp_price)
+        cost = 0.0  # surplus 원가 0 가정
+        profit = revenue - cost
+
+        self.ess_soc = max(0.0, self.ess_soc - self._kwh_to_soc_delta(discharge_kwh))
+        self.cumulative_profit += profit
+        return (f"[PHASE 1] ESS 방전 {discharge_kwh:.1f}kWh "
+                f"(유효 {sellable_kwh:.1f}kWh, SoC {self.ess_soc:.1f}%)"), revenue, cost, profit
+
+    def make_ai_decision(self, current_time, b_load_power, b_load_average, smp_price):
+        revenue = cost = profit = 0.0
+
+        # 연속 방전 세션이 진행 중이면 계속 방전 (SMP가 아주 낮지 않은 한)
+        if self.discharge_session > 0:
+            self.discharge_session -= 1
+            msg, revenue, cost, profit = self._discharge_once(smp_price)
+            return f"[PHASE 1-연속방전] {msg} (잔여 {self.discharge_session}h)", revenue, cost, profit
+
+        # Phase 2 (동일)
+        is_b_peak_detected = (b_load_power >= b_load_average * self.B_LOAD_PEAK_RATIO)
+        if is_b_peak_detected:
+            if b_load_power > self.ESS_MAX_DISCHARGE_KW:
+                if self.h2_storage > 0:
+                    # === 수소 잔량 방전 반영 (퍼센트 모델) ===
+                    # ESS가 커버 못하는 필요전력(kW)
+                    required_kw = b_load_power - self.ESS_MAX_DISCHARGE_KW
+                    # 연료전지 한도 내에서 공급
+                    fc_kw = min(required_kw, self.H2_FUEL_CELL_KW)
+
+                    if fc_kw > 0:
+                        # 100% 수소 = 연료전지 정격(H2_FUEL_CELL_KW)로 1시간 가동한다고 가정
+                        needed_pct_hour = (fc_kw / self.H2_FUEL_CELL_KW) * self.H2_PCT_PER_HOUR_AT_RATED
+                        use_pct = min(self.h2_storage, needed_pct_hour)
+
+                        # 실제 공급 전력은 사용 퍼센트에 비례
+                        supplied_kw = (use_pct / 100.0) * self.H2_FUEL_CELL_KW
+
+                        # 수소 잔량 차감
+                        self.h2_storage = max(0.0, self.h2_storage - use_pct)
+
+                        return (f"[PHASE 2] B부하 피크 감지! 연료전지 {supplied_kw:.1f}kW 가동 "
+                                f"(H2 -{use_pct:.1f}% → {self.h2_storage:.1f}%)",
+                                revenue, cost, profit)
+                    else:
+                        return "[ERROR] B부하 피크 감지! 연료전지 출력 0kW", revenue, cost, profit
+                else:
+                    return "[ERROR] B부하 피크 감지! 사용가능한 수소 없음!", revenue, cost, profit
+            else:
+                if self.ess_soc > (b_load_power / self.ESS_MAX_DISCHARGE_KW * 100):
+                    return "[PHASE 1] B부하 피크 감지. ESS로 대응합니다.", revenue, cost, profit
+                else:
+                    return "[ERROR] B부하 피크 감지! ESS 잔량 부족!", revenue, cost, profit
+
+        # Phase 1 (경제성 트리거)
+        is_ess_ready = (self.ess_soc > self.ESS_PROFIT_THRESHOLD)
+        is_smp_high = (smp_price > self.SMP_PROFIT_THRESHOLD)
+
+        if is_ess_ready and is_smp_high:
+            # 방전 세션 시작: 현재 포함 1h + 이후 (SESSION_LENGTH-1)h
+            self.discharge_session = max(self.SESSION_LENGTH - 1, 0)
+            msg, revenue, cost, profit = self._discharge_once(smp_price)
+            return f"[PHASE 1-세션시작] {msg} (추가 {self.discharge_session}h 예정)", revenue, cost, profit
+
+        return "IDLE (B부하 안정, SMP 낮음 또는 ESS 잔량 부족)", revenue, cost, profit
+
+
+# ===== 3) 시뮬레이션 설정 =====
+# (기존 코드와 동일)
+system = HybridEnergySystem(
+    initial_ess_soc=30.0,
+    initial_h2_storage=90.0,
+    ess_capacity_kwh=5000.0,
+    round_trip_eff=0.92,
+    session_length_hours=3
+)
+FORCE_PHASE2_ONCE = True
+if FORCE_PHASE2_ONCE:
+    dynamic_ratio = (b_load_max / b_load_avg) * 0.98
+    system.B_LOAD_PEAK_RATIO = dynamic_ratio
+    print(f"⚙️  B_LOAD_PEAK_RATIO 동적 설정: {dynamic_ratio:.3f} (기본 1.500 → 동적값)")
+
+# ===== (수정) 4) 24시간 루프 실행 + 아두이노 제어 =====
+
+logs = []
+cum_profit = 0.0
+ser = None  # 시리얼 객체 초기화
+
+try:
+    # --- (추가) 아두이노 블루투스 연결 ---
+    print(f"\n[Arduino] {BLUETOOTH_PORT} 포트에 연결 시도 중...")
+    ser = serial.Serial(BLUETOOTH_PORT, BAUD_RATE, timeout=1)
+    print("[Arduino] 연결 성공!")
+    time.sleep(2)  # 아두이노 부트로더 대기
+    send_command(ser, "stop")  # 시작 시 정지 명령
+    print("--- 24시간 시뮬레이션 및 차량 제어를 시작합니다 ---")
+
+    # --- 기존 24시간 루프 ---
+    for _, r in df.iterrows():
+        hour = int(r["hour"])
+        surplus = float(r["surplus_kWh"])
+        smp = float(r["SMP_price"])
+        b_load = float(r["B_load_kWh"])
+
+        print(f"\n--- [ {hour}시 ] 시뮬레이션 시작 ---")
+
+        # (1) 잉여전력 충전
+        charge_action, ch_rev, ch_cost, ch_profit = system.charge_assets(hour, surplus)
+
+        # (2) AI 운영 판단
+        decision, revenue, cost, profit = system.make_ai_decision(hour, b_load, b_load_avg, smp)
+
+        # (3) (추가) AI 결정(decision)을 파싱하여 아두이노 명령어로 변환
+        arduino_command = "stop"  # 기본값은 정지
+
+        if "[PHASE 1]" in decision:
+            arduino_command = "forward"
+        elif "[PHASE 2]" in decision:
+            arduino_command = "backward"
+
+        print(f"[AI] Decision: {decision}")
+        print(f"[AI] -> Mapped to Arduino Command: {arduino_command}")
+
+        # (4) (추가) 아두이노로 명령어 전송
+        send_command(ser, arduino_command)
+
+        # (5) (추가) 차량이 움직일 시간 대기
+        print(f"[System] {TIME_PER_HOUR_SEC}초 동안 차량 동작 수행...")
+        time.sleep(TIME_PER_HOUR_SEC)
+
+        # (6) (추가) 다음 시간을 위해 차량 정지 (선택 사항이지만 안전함)
+        if arduino_command != "stop":
+            send_command(ser, "stop")
+            print("[System] 다음 시간 시뮬레이션을 위해 차량 정지")
+
+        # --- 기존 로그 저장 로직 ---
+        net_profit = (ch_profit + profit) - ch_cost
+        cum_profit += net_profit
+        logs.append({
+            "hour": hour, "B_load_kWh": b_load, "SMP_price": smp,
+            "surplus_kWh": surplus, "decision": decision,
+            "charge_action": charge_action, "ess_soc(%)": round(system.ess_soc, 2),
+            "h2_storage(%)": round(system.h2_storage, 2), "revenue_won": round(revenue, 0),
+            "cost_won": round(ch_cost + cost, 0), "profit_won": round(net_profit, 0),
+            "cum_profit_won": round(cum_profit, 0)
+        })
+
+    print("\n--- 24시간 시뮬레이션 및 제어 완료 ---")
+
+except serial.SerialException as e:
+    print(f"\n[Arduino] 오류: {BLUETOOTH_PORT} 포트에 연결할 수 없습니다.")
+    print(f"상세 정보: {e}")
+    print("1. HC-05가 PC와 페어링되었는지 확인하세요.")
+    print("2. COM 포트 번호가 올바른지 확인하세요.")
+    print("3. 아두이노에 전원이 켜져 있는지 확인하세요.")
+
+except KeyboardInterrupt:
+    print("\n[System] 사용자에 의해 프로그램이 중단되었습니다.")
+
+finally:
+    # --- (추가) 스크립트 종료 시 아두이노 연결 해제 및 정지 ---
+    if ser and ser.is_open:
+        print("[Arduino] 모든 작업을 종료하고 차량을 정지합니다.")
+        send_command(ser, "stop")
+        ser.close()
+        print("[Arduino] 연결을 종료합니다.")
+    else:
+        print("\n[Arduino] 연결이 시작되지 않았거나 이미 종료되었습니다.")
+
+# ===== 5) 결과 저장 & 요약 =====
+# (기존 코드와 동일, 시뮬레이션이 끝나면 엑셀 파일 저장)
+if logs:  # 로그가 하나라도 있어야 실행
+    result = pd.DataFrame(logs)
+
+    OUT_XLSX = "AI_Daily_Operation_Log_new.xlsx"
+    OUT_CSV = "AI_Daily_Operation_Log_new.csv"
+    result.to_excel(OUT_XLSX, index=False)
+    result.to_csv(OUT_CSV, index=False, encoding="utf-8-sig")
+
+    print(f"\n💾 결과 저장 완료: {OUT_XLSX}, {OUT_CSV}")
+    print(result.head(10)[["hour", "decision", "revenue_won", "cost_won", "profit_won"]])
+
+    summary = result["decision"].value_counts()
+    print("\n=== 의사결정 요약 ===")
+    for k, v in summary.items():
+        print(f"{k}: {v}시간")
+
+    phase2_hours = result.loc[result["decision"].str.contains("PHASE 2", na=False), "hour"].tolist()
+    print("\nPHASE 2 발생 시각:", phase2_hours if phase2_hours else "없음")
+    print("총 누적 이익(원):", int(result["cum_profit_won"].iloc[-1]))
+else:
+    print("\n[System] 시뮬레이션 로그가 없어 결과 파일을 저장하지 않습니다.")
