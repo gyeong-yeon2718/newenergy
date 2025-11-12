@@ -1,4 +1,8 @@
 # ARDUINO MEGA 2560 블루투스 제어
+# 코드 설명: HW팀에서 올려준 코드에 '블루투스 제어'를 추가했습니다. 
+블루투스 모듈에서 읽어온 command 가 'foward' 'backward' 'stop' 중 무엇인지 판단하여 모터를 제어합니다.
+
+
 // ===============================
 // DFRobot Motor Shield R3 (DFR0406)
 // Arduino Mega 2560
