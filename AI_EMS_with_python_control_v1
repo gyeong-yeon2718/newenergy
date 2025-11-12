@@ -11,15 +11,15 @@ phase 1 인지 phase 2인지 판단하여 아두이노 차량에게 앞/뒤/정�
 # ==========================================================
 
 import pandas as pd
-import serial  # (추가) 아두이노 제어용
-import time  # (추가) 실시간 제어용
+import serial  # 아두이노 제어용
+import time  # 실시간 제어용
 
-# ===== (추가) 아두이노 블루투스 설정 =====
-# (필수 수정!) PC 장치 관리자에서 확인한 COM 포트
+# ===== 아두이노 블루투스 설정 =====
+# (수정해야함) PC 장치 관리자에서 확인한 COM 포트
 BLUETOOTH_PORT = "COM7"
 BAUD_RATE = 9600
 
-# (필수 수정!) 시뮬레이션 1시간(1 loop)당 대기할 시간 (초)
+# (수정해야함) 시뮬레이션 1시간(1 loop)당 대기할 시간 (초)
 # 차량이 해당 동작(전진/후진)을 수행할 시간
 TIME_PER_HOUR_SEC = 5.0
 
@@ -33,7 +33,7 @@ def send_command(ser, command):
         command_with_newline = command + '\n'
         ser.write(command_with_newline.encode('utf-8'))
         print(f"[Arduino] Sent: {command}")
-        time.sleep(0.1)  # 전송 안정성을 위한 짧은 대기
+        time.sleep(0.1)  # 전송 안정성을 위한 대기시간
     except Exception as e:
         print(f"[Arduino] Error sending command: {e}")
 
@@ -52,17 +52,16 @@ except FileNotFoundError:
     print("스크립트와 같은 폴더에 엑셀 파일이 있는지 확인하세요.")
     exit()  # 파일 없으면 종료
 
-# (이하 기존 코드와 동일)
+# (기존 코드와 동일)
 required_cols = {"hour", "A_load_kWh", "B_load_kWh", "SMP_price", "surplus_kWh"}
 missing = required_cols - set(df.columns)
 b_load_avg = float(df["B_load_kWh"].mean())
 b_load_max = float(df["B_load_kWh"].max())
 
 
-# ===== 2) 규칙기반 AI 클래스 (경제성 + 충전확대 + 연속방전) =====
-# (제공해주신 클래스 코드 - 변경 없음)
+# ===== 2) 규칙기반 AI 클래스  =====
 class HybridEnergySystem:
-    # ... (제공해주신 클래스 코드 전체) ...
+    
     """
     A부하(주택), B부하(공장), ESS, 수소연료전지 관리 + Phase1 경제성 계산
     - 낮 10~15시 충전(잉여전력×보정)
@@ -102,7 +101,7 @@ class HybridEnergySystem:
         # 경제성 누적
         self.cumulative_profit = 0.0
 
-    # --- SoC% ↔ kWh 변환 유틸 ---
+    # --- SoC% ↔ kWh 변환 함수 ---
     def _soc_to_kwh(self) -> float:
         return (self.ess_soc / 100.0) * self.ESS_CAPACITY_KWH
 
@@ -225,14 +224,14 @@ if FORCE_PHASE2_ONCE:
     system.B_LOAD_PEAK_RATIO = dynamic_ratio
     print(f"⚙️  B_LOAD_PEAK_RATIO 동적 설정: {dynamic_ratio:.3f} (기본 1.500 → 동적값)")
 
-# ===== (수정) 4) 24시간 루프 실행 + 아두이노 제어 =====
+# ===== 4) 24시간 루프 실행 + 각 시간마다 아두이노 차량 제어 =====
 
 logs = []
 cum_profit = 0.0
 ser = None  # 시리얼 객체 초기화
 
 try:
-    # --- (추가) 아두이노 블루투스 연결 ---
+    # --- 아두이노 블루투스 연결 ---
     print(f"\n[Arduino] {BLUETOOTH_PORT} 포트에 연결 시도 중...")
     ser = serial.Serial(BLUETOOTH_PORT, BAUD_RATE, timeout=1)
     print("[Arduino] 연결 성공!")
@@ -255,7 +254,7 @@ try:
         # (2) AI 운영 판단
         decision, revenue, cost, profit = system.make_ai_decision(hour, b_load, b_load_avg, smp)
 
-        # (3) (추가) AI 결정(decision)을 파싱하여 아두이노 명령어로 변환
+        # (3) AI 결정(decision)을 파싱하여 아두이노 명령어로 변환
         arduino_command = "stop"  # 기본값은 정지
 
         if "[PHASE 1]" in decision:
@@ -266,14 +265,14 @@ try:
         print(f"[AI] Decision: {decision}")
         print(f"[AI] -> Mapped to Arduino Command: {arduino_command}")
 
-        # (4) (추가) 아두이노로 명령어 전송
+        # (4) 아두이노로 명령어 전송
         send_command(ser, arduino_command)
 
-        # (5) (추가) 차량이 움직일 시간 대기
+        # (5) 차량이 움직일 시간 대기
         print(f"[System] {TIME_PER_HOUR_SEC}초 동안 차량 동작 수행...")
         time.sleep(TIME_PER_HOUR_SEC)
 
-        # (6) (추가) 다음 시간을 위해 차량 정지 (선택 사항이지만 안전함)
+        # (6) 다음 시간을 위해 차량 정지 
         if arduino_command != "stop":
             send_command(ser, "stop")
             print("[System] 다음 시간 시뮬레이션을 위해 차량 정지")
@@ -303,7 +302,7 @@ except KeyboardInterrupt:
     print("\n[System] 사용자에 의해 프로그램이 중단되었습니다.")
 
 finally:
-    # --- (추가) 스크립트 종료 시 아두이노 연결 해제 및 정지 ---
+    # --- 스크립트 종료 시 아두이노 연결 해제 및 정지 ---
     if ser and ser.is_open:
         print("[Arduino] 모든 작업을 종료하고 차량을 정지합니다.")
         send_command(ser, "stop")
@@ -313,7 +312,7 @@ finally:
         print("\n[Arduino] 연결이 시작되지 않았거나 이미 종료되었습니다.")
 
 # ===== 5) 결과 저장 & 요약 =====
-# (기존 코드와 동일, 시뮬레이션이 끝나면 엑셀 파일 저장)
+# (시뮬레이션이 끝나면 엑셀 파일 저장)
 if logs:  # 로그가 하나라도 있어야 실행
     result = pd.DataFrame(logs)
 
